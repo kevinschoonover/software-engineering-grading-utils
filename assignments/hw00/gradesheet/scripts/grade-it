@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+# -*- mode: python -*-
+
+import argparse
+import json
+import logging
+import os
+import subprocess
+import time
+
+import git
+
+import gitlab
+
+logger = logging.getLogger("grade-it")
+
+parser = argparse.ArgumentParser(description='Grade a Python assignment.')
+parser.add_argument('dir', help='The path to the unpacked student submission')
+
+GITLAB_ACCESS_TOKEN = "2N7y5RnVnAvPeq_5Y7qT"
+GITLAB_URL = "https://git-classes.mst.edu"
+CLASS_GROUP_ID = 2053
+SETUP_COMMIT_NUM = 2
+gl = gitlab.Gitlab(GITLAB_URL, private_token=GITLAB_ACCESS_TOKEN)
+
+MADE_COMMITS_TASK = "user_has_made_commits"
+CREATE_ISSUE_BOARD_TASK = "user_has_created_issue_board"
+CREATE_MERGE_REQUEST_TASK = "user_has_create_merge_request"
+COMPLETE_MERGE_REQUEST_TASK = "user_has_completed_merge_request"
+MADE_ISSUE_TASK = "user_has_made_issue"
+CLOSED_ISSUE_TASK = "user_has_closed_issue"
+FIXED_ISSUE_TASK = "user_has_fixed_client_issue"
+
+results = {
+    "grade": 0,
+    "tasks": []
+}
+
+
+def pass_test(test_name, msg="Well done!"):
+    results["tasks"].append({
+        "task_name": test_name,
+        "completed": True,
+        "msg": msg
+    })
+
+
+def fail_test(test_name, msg):
+    results["tasks"].append({
+        "task_name": test_name,
+        "completed": False,
+        "msg": msg
+    })
+
+
+def run(unpack_dir):
+    os.chdir(unpack_dir)
+
+    try:
+        code_dir, = os.listdir()
+    except ValueError:
+        logger.critical(
+            "There is not exactly one directory in here... {}\n"
+            "I don't know how to proceed. Abort!".format(os.listdir())
+        )
+
+    os.chdir(code_dir)
+
+    logger.info("Time to start the tests.")
+    repo = git.Repo(".")
+
+    if repo.bare:
+        raise Exception("Repo not loaded properly")
+
+    logger.info("Staring repo tests.")
+    commit_count = [commit.count() for commit in repo.iter_commits('master')]
+
+    if max(commit_count) <= SETUP_COMMIT_NUM:
+        fail_test(MADE_COMMITS_TASK,
+                  "No extra commits have been made or master is corrupted.")
+    else:
+        pass_test(MADE_COMMITS_TASK)
+
+    remote_url = repo.remotes.origin.url
+    cs3100_group = gl.groups.get(CLASS_GROUP_ID)
+    for project in cs3100_group.projects.list(all=True):
+        ssh_url = project.ssh_url_to_repo
+        http_url = project.http_url_to_repo
+        if remote_url == ssh_url or remote_url == http_url:
+            project_obj = gl.projects.get(project.id)
+
+            if len(project_obj.boards.list()) == 0:
+                fail_test(
+                    CREATE_ISSUE_BOARD_TASK,
+                    "No issue board has been created."
+                )
+            else:
+                pass_test(CREATE_ISSUE_BOARD_TASK)
+
+            merge_requests = project_obj.mergerequests.list()
+
+            if len(merge_requests) == 0:
+                fail_test(
+                    CREATE_MERGE_REQUEST_TASK,
+                    "No merge request has been added"
+                )
+                fail_test(
+                    COMPLETE_MERGE_REQUEST_TASK,
+                    "No merge request has been added"
+                )
+            else:
+                pass_test(CREATE_MERGE_REQUEST_TASK)
+                merge_request = merge_requests[0]
+
+                if merge_request.state != "merged":
+                    fail_test(
+                        COMPLETE_MERGE_REQUEST_TASK,
+                        (
+                            "The first merge request does not have the state "
+                            "'merged'. Ask for manual regrade if you have multiple "
+                            "PRs."
+                        )
+                    )
+                else:
+                    pass_test(COMPLETE_MERGE_REQUEST_TASK)
+
+            issues = project_obj.issues.list()
+            if not issues:
+                break
+
+            issue = issues[0]
+            expected_issue_title = "Fix client.py not connecting to server.py"
+            if issue.title != expected_issue_title:
+                fail_test(
+                    MADE_ISSUE_TASK,
+                    "Issue with title '{}' not the first issue.".format(
+                        expected_issue_title
+                    )
+                )
+            else:
+                pass_test(MADE_ISSUE_TASK)
+
+            if issue.state != "closed":
+                fail_test(
+                    CLOSED_ISSUE_TASK,
+                    "First issue does not have state 'closed'."
+                )
+            else:
+                pass_test(CLOSED_ISSUE_TASK)
+
+    logger.info("Starting code tests")
+    server = subprocess.Popen(["python3", "server.py"], stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE)
+    time.sleep(.75)
+    client = subprocess.Popen(["python3", "client.py"], stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE)
+
+    while server.poll() is None and client.poll() is None:
+        time.sleep(1)
+
+    client_stdout = client.stdout.read().decode("utf-8")
+    client_expected_stdout = "Connecting to server at localhost:5000\nSuccess!\n"
+    server_stdout = server.stdout.read().decode("utf-8")
+    server_expected_stdout = "Listening on localhost:5000\nSuccess!\n"
+
+    print(client_stdout)
+    print(client_expected_stdout)
+    print(server_stdout)
+    print(server_expected_stdout)
+
+    if client_stdout != client_expected_stdout or server_stdout != server_expected_stdout:
+        fail_test(
+            FIXED_ISSUE_TASK,
+            "Either 'server.py' or 'client.py' did not match expected output"
+        )
+    else:
+        pass_test(FIXED_ISSUE_TASK)
+
+    logger.info("Checking bonus")
+    try:
+        repo.git.checkout('bonus')
+        commit_count = [commit.count() for commit in repo.iter_commits()]
+        num_commits = max(commit_count)
+
+        if num_commits == 1:
+            pass_test("bonus")
+        else:
+            fail_test(
+                "bonus",
+                "Your bonus branch has {} commits (expected 1)".format(
+                    num_commits
+                )
+            )
+    except:
+        fail_test("bonus", "Bonus branch does not exist")
+
+    completed_tasks = sum([task["completed"] for task in results["tasks"]])
+    results["grade"] = completed_tasks / 7 * 100
+    print(json.dumps(results, indent=4))
+
+
+if __name__ == '__main__':
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.ERROR)
+    run(args.dir)
